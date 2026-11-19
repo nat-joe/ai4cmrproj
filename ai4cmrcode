@@ -1,0 +1,312 @@
+"""Far North Cameroon planting helper — standard-library-only command line app.
+
+Run with: python app.py
+Rainfall CSV format: date,rain_mm (one daily row per observation).
+The forecast is model guidance from Open-Meteo, not an official station report.
+"""
+
+import csv
+import json
+import statistics
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+
+LANGUAGES = {"1": "English", "2": "Français", "3": "Fulfulde", "4": "Hausa", "5": "Kanuri"}
+DEFAULT_LATITUDE = 10.59  # Maroua
+DEFAULT_LONGITUDE = 14.32
+TEXT = {
+    "English": {
+        "title": "Far North Cameroon — planting helper",
+        "window": "Historical estimate: rainy-season onset around {onset}; suggested planting window {start} to {end}, based on {years} seasons.",
+        "none": "No onset found. Check the CSV or adjust the rainfall settings in this script.",
+        "forecast": "7-day model rainfall: {rain} mm. This is model guidance, not a station observation.",
+        "no_forecast": "Live forecast unavailable: {error}",
+        "sms": "{place}: planting window {start}-{end}. 7-day forecast rain: {rain} mm. Check local advice.",
+        "ussd": "{place}: planting {start}-{end}; 7-day rain {rain} mm. Historical estimate + model forecast.",
+    },
+    "Français": {
+        "title": "Extrême-Nord Cameroun — aide aux semis",
+        "window": "Estimation historique : début des pluies vers le {onset} ; fenêtre de semis suggérée du {start} au {end}, basée sur {years} saisons.",
+        "none": "Aucun début de saison détecté. Vérifiez le CSV ou ajustez les seuils dans le script.",
+        "forecast": "Pluie prévue par le modèle sur 7 jours : {rain} mm. Ce n’est pas une observation de station.",
+        "no_forecast": "Prévision indisponible : {error}",
+        "sms": "{place} : semis du {start} au {end}. Pluie prévue sur 7 j : {rain} mm. Suivez les conseils locaux.",
+        "ussd": "{place} : semis {start}-{end} ; pluie 7 j {rain} mm. Estimation historique et modèle météo.",
+    },
+    "Fulfulde": {
+        "title": "Far North Cameroon — wallitorde sowugol",
+        "window": "Yiytude hakkunde: ndiyam fuɗɗata e {onset}; sahaa sowugol {start} haa {end}. Duuɓi {years}.",
+        "none": "Fuɗɗorde yiytaaka. Ƴeewto CSV walla waylu limɗe e script.",
+        "forecast": "Ndiyam model ñalɗi 7: {rain} mm. Ɗum wonaa yiytorde station.",
+        "no_forecast": "Habaru jawdi heɓaaka: {error}",
+        "sms": "{place}: sahaa sowugol {start}-{end}. Ndiyam ñalɗi 7: {rain} mm. Ƴeewto jaŋde gese.",
+        "ussd": "{place}: sowugol {start}-{end}; ndiyam ñalɗi 7 {rain} mm.",
+    },
+    "Hausa": {
+        "title": "Arewa Mai Nisa ta Kamaru — taimakon shuka",
+        "window": "Ƙiyasin tarihi: damina za ta fara kusa da {onset}; lokacin shuka {start} zuwa {end}, bisa shekaru {years}.",
+        "none": "Ba a gano farkon damina ba. Duba CSV ko gyara ma'aunin da ke cikin rubutun.",
+        "forecast": "Hasashen samfurin ruwan sama na kwanaki 7: {rain} mm. Ba auna tashar yanayi kai tsaye ba.",
+        "no_forecast": "Ba a samu hasashen yanzu ba: {error}",
+        "sms": "{place}: lokacin shuka {start}-{end}. Hasashen ruwan sama na kwanaki 7: {rain} mm. Bi shawarar gida.",
+        "ussd": "{place}: shuka {start}-{end}; ruwan sama kwanaki 7 {rain} mm.",
+    },
+    "Kanuri": {
+        "title": "Far North Cameroon — bərno kəla",
+        "window": "Tarihi ƙiyas: lawo bərno {onset}; bərno kəla {start} haa {end}. Shekaru {years}.",
+        "none": "Bərno nəmro ba. CSV duba ko script ma'auni gyara.",
+        "forecast": "Kwanaki 7 model lawo: {rain} mm. Station auna ba.",
+        "no_forecast": "Hasashen yanzu nəmro ba: {error}",
+        "sms": "{place}: bərno kəla {start}-{end}. Kwanaki 7 lawo {rain} mm. Gida shawara duba.",
+        "ussd": "{place}: bərno {start}-{end}; kwanaki 7 lawo {rain} mm.",
+    },
+}
+
+# Example onset rule. Tune with local agronomists and crop-specific guidance.
+SEASON_START_MONTH = 4
+RAIN_THRESHOLD_3_DAYS_MM = 20.0
+DRY_SPELL_CHECK_DAYS = 7
+FORECAST_DRY_DAY_MM = 1.0
+FORECAST_DRY_SPELL_DAYS = 5
+FORECAST_LOW_RAIN_MM = 5.0
+FORECAST_USEFUL_RAIN_MM = 10.0
+FORECAST_HEAVY_RAIN_MM = 35.0
+
+INTENT_KEYWORDS = {
+    "help": ("help", "aide", "commands", "commandes"),
+    "planting": ("plant", "planting", "sow", "sowing", "semis", "semer", "shuka", "sowugol", "bərno"),
+    "dry_spell": ("dry", "drought", "no rain", "little rain", "secheresse", "sécheresse", "pas de pluie", "ruwan sama kadan", "ndiyam alaa", "saharaa"),
+    "heavy_rain": ("flood", "flooding", "heavy rain", "too much rain", "inondation", "forte pluie", "ambaliya", "ruwa mai yawa"),
+    "rainfall": ("rain", "rainfall", "weather", "forecast", "pluie", "météo", "jawdi", "hasashe", "lawo"),
+    "satellite": ("satellite", "image", "imagery", "ndvi", "satelit"),
+}
+
+
+def classify_question(question):
+    """Assign a fixed intent from keyword rules; no generative model is used."""
+    normalized = question.casefold()
+    # Prioritize explicit hazard and dry-spell questions over general rain words.
+    for intent in ("heavy_rain", "dry_spell", "planting", "satellite", "rainfall", "help"):
+        if any(word in normalized for word in INTENT_KEYWORDS[intent]):
+            return intent
+    return "unknown"
+
+
+def longest_dry_spell(daily):
+    values = daily.get("precipitation_sum", []) if daily else []
+    longest = run = 0
+    for amount in values:
+        if (amount or 0) < FORECAST_DRY_DAY_MM:
+            run += 1
+            longest = max(longest, run)
+        else:
+            run = 0
+    return longest
+
+
+def answer_by_rules(question, lang, planting, forecast_total, forecast_daily):
+    """Return a deterministic response using intent keywords and thresholds."""
+    intent = classify_question(question)
+    if intent == "help":
+        return "Topics: planting, rainfall/forecast, dry spell, heavy rain/flood risk, satellite image. Commands: sms, ussd, refresh, quit."
+    if intent == "satellite":
+        return "The image is not analyzed by this script. Use it for manual review with a local agriculture or extension worker."
+    if intent == "planting":
+        if not planting:
+            return TEXT[lang]["none"]
+        _, start, finish, _ = planting
+        advice = f"Historical planting window: {start:%d %b}–{finish:%d %b}."
+        if forecast_total is not None and forecast_total < FORECAST_LOW_RAIN_MM:
+            advice += " The next 7 days are forecast to be relatively dry; this does not confirm field soil moisture."
+        return advice
+    if intent == "dry_spell":
+        if forecast_daily is None:
+            return "No live daily forecast is available. Check local rainfall observations and extension advice."
+        dry_days = longest_dry_spell(forecast_daily)
+        if dry_days >= FORECAST_DRY_SPELL_DAYS:
+            return f"Rule alert: forecast has {dry_days} consecutive days below {FORECAST_DRY_DAY_MM:g} mm/day. Delay planting decisions until local soil moisture and updated advice are checked."
+        return f"Rule check: longest forecast dry spell is {dry_days} day(s), below the {FORECAST_DRY_SPELL_DAYS}-day alert threshold. Forecasts can change."
+    if intent == "heavy_rain":
+        if forecast_total is None:
+            return "No live forecast is available. Check local weather warnings."
+        if forecast_total >= FORECAST_HEAVY_RAIN_MM:
+            return f"Rule alert: forecast rainfall is {forecast_total:g} mm over 7 days (threshold {FORECAST_HEAVY_RAIN_MM:g} mm). Monitor official warnings, drainage, and flood-prone fields."
+        return f"The 7-day rainfall forecast is {forecast_total:g} mm, below this prototype's {FORECAST_HEAVY_RAIN_MM:g} mm heavy-rain alert threshold. This is not a flood guarantee."
+    if intent == "rainfall":
+        if forecast_total is None:
+            return "No live forecast is available. Try `refresh` or check local weather observations."
+        if forecast_total < FORECAST_LOW_RAIN_MM:
+            label = "low"
+        elif forecast_total < FORECAST_USEFUL_RAIN_MM:
+            label = "limited"
+        elif forecast_total < FORECAST_HEAVY_RAIN_MM:
+            label = "moderate"
+        else:
+            label = "high"
+        return f"Rule classification: {label} rainfall over the next 7 days ({forecast_total:g} mm total). Source: Open-Meteo model forecast."
+    return "I did not match that to a rule. Ask about planting, rain/forecast, dry spell, heavy rain, or satellite imagery; type `help` for commands."
+
+
+def read_rainfall_csv(filename):
+    """Read rows with date,rain_mm columns. Returns {date: millimetres}."""
+    rain = {}
+    with open(filename, newline="", encoding="utf-8-sig") as stream:
+        reader = csv.DictReader(stream)
+        if not reader.fieldnames or not {"date", "rain_mm"}.issubset(reader.fieldnames):
+            raise ValueError("CSV needs columns named date and rain_mm")
+        for row in reader:
+            try:
+                day = date.fromisoformat(row["date"].strip()[:10])
+                amount = float(row["rain_mm"])
+                if amount >= 0:
+                    rain[day] = amount
+            except (TypeError, ValueError, AttributeError):
+                continue
+    if not rain:
+        raise ValueError("No valid date,rain_mm rows found")
+    return rain
+
+
+def find_onsets(rain):
+    years = sorted({day.year for day in rain})
+    onsets = []
+    for year in years:
+        start = date(year, SEASON_START_MONTH, 1)
+        end = date(year + 1, 1, 1) if SEASON_START_MONTH > 1 else date(year, 12, 31)
+        days = []
+        current = start
+        while current < end:
+            days.append(current)
+            current += timedelta(days=1)
+        for index in range(2, len(days) - DRY_SPELL_CHECK_DAYS):
+            event_day = days[index]
+            three_day_total = sum(rain.get(days[j], 0.0) for j in range(index - 2, index + 1))
+            if three_day_total < RAIN_THRESHOLD_3_DAYS_MM:
+                continue
+            following = [rain.get(days[j], 0.0) for j in range(index + 1, index + 1 + DRY_SPELL_CHECK_DAYS)]
+            if len(following) == DRY_SPELL_CHECK_DAYS and all(value < 1.0 for value in following):
+                continue
+            onsets.append(event_day)
+            break
+    return onsets
+
+
+def historical_window(rain):
+    onsets = find_onsets(rain)
+    if not onsets:
+        return None
+    day_numbers = [item.timetuple().tm_yday for item in onsets]
+    middle = round(statistics.median(day_numbers))
+    onset = date(2021, 1, 1) + timedelta(days=middle - 1)
+    return onset, onset + timedelta(days=7), onset + timedelta(days=21), len(onsets)
+
+
+def fetch_forecast(latitude, longitude):
+    """Fetch seven-day precipitation from Open-Meteo; requires internet access."""
+    params = urlencode({
+        "latitude": latitude,
+        "longitude": longitude,
+        "daily": "precipitation_sum,precipitation_probability_max,temperature_2m_max",
+        "forecast_days": 7,
+        "timezone": "Africa/Douala",
+    })
+    request = Request("https://api.open-meteo.com/v1/forecast?" + params,
+                      headers={"User-Agent": "FarNorthPlantingHelper/1.0"})
+    with urlopen(request, timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    daily = payload.get("daily", {})
+    rain = daily.get("precipitation_sum", [])
+    return daily, round(sum(value or 0 for value in rain), 1)
+
+
+def choose_language():
+    print("\nChoose language / Choisir la langue / Suɓo ɗemngal / Zaɓi harshe:")
+    for number, language in LANGUAGES.items():
+        print(f"  {number}. {language}")
+    return LANGUAGES.get(input("Language [1-5, default 1]: ").strip(), "English")
+
+
+def main():
+    language = choose_language()
+    text = TEXT[language]
+    print(f"\n{text['title']}")
+    place = input("Village/town [Maroua]: ").strip() or "Maroua"
+    try:
+        latitude = float(input(f"Latitude [{DEFAULT_LATITUDE}]: ").strip() or DEFAULT_LATITUDE)
+        longitude = float(input(f"Longitude [{DEFAULT_LONGITUDE}]: ").strip() or DEFAULT_LONGITUDE)
+        if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+            raise ValueError("Coordinates out of range")
+    except ValueError as error:
+        print(f"Invalid coordinates: {error}")
+        return
+
+    rainfall_file = input("Historical daily rainfall CSV path (Enter to skip): ").strip()
+    image_file = input("Satellite image path for your own visual review (Enter to skip): ").strip()
+    planting = None
+    if rainfall_file:
+        try:
+            rain = read_rainfall_csv(Path(rainfall_file).expanduser())
+            planting = historical_window(rain)
+            if planting:
+                onset, start, finish, count = planting
+                print("\n" + text["window"].format(onset=onset.strftime("%d %b"),
+                    start=start.strftime("%d %b"), end=finish.strftime("%d %b"), years=count))
+            else:
+                print("\n" + text["none"])
+        except (OSError, ValueError) as error:
+            print(f"\nCSV problem: {error}")
+    else:
+        print("\nNo historical rainfall loaded; the planting-window estimate is unavailable.")
+
+    if image_file:
+        if Path(image_file).expanduser().is_file():
+            print("Satellite image file found. This lightweight version does not analyze imagery; review it with a local expert.")
+        else:
+            print("Image file not found. No image analysis is performed by this version.")
+
+    forecast = None
+    forecast_daily = None
+    try:
+        forecast_daily, weekly_rain = fetch_forecast(latitude, longitude)
+        forecast = weekly_rain
+        print(text["forecast"].format(rain=weekly_rain))
+        print("Data source: Open-Meteo Forecast API (numerical model guidance).")
+    except Exception as error:
+        print(text["no_forecast"].format(error=error))
+
+    print("\nCommands: ask <question>, sms, ussd, refresh, help, quit")
+    while True:
+        command = input("> ").strip()
+        low = command.lower()
+        if low in {"quit", "exit", "q"}:
+            break
+        if low == "help":
+            print("Rule topics: planting, rainfall/forecast, dry spell, heavy rain, satellite. `sms` and `ussd` draft alerts; `refresh` reloads the forecast.")
+        elif low == "refresh":
+            try:
+                forecast_daily, forecast = fetch_forecast(latitude, longitude)
+                print(text["forecast"].format(rain=forecast))
+            except Exception as error:
+                print(text["no_forecast"].format(error=error))
+        elif low in {"sms", "ussd"}:
+            if not planting:
+                print(text["none"])
+                continue
+            _, start, finish, _ = planting
+            message = text[low].format(place=place, start=start.strftime("%d %b"),
+                end=finish.strftime("%d %b"), rain=forecast if forecast is not None else "N/A")
+            print(message)
+        elif low.startswith("ask "):
+            question = command[4:].strip()
+            print(answer_by_rules(question, language, planting, forecast, forecast_daily))
+        elif low:
+            print(answer_by_rules(command, language, planting, forecast, forecast_daily))
+        else:
+            print("Type help for commands.")
+
+
+if __name__ == "__main__":
+    main()
